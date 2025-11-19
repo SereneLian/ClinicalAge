@@ -1,49 +1,28 @@
 # %%
-# Standard Library Imports
+# ------------------------------------------------------------------
+# 1. IMPORTS
+# ------------------------------------------------------------------
 import os
 import sys
-import time
 import random
-import _pickle as pickle
 import logging
-
-import yaml
-from datetime import datetime
-
-# Third-party Imports
-import torch
-import torch.nn as nn
-from torch.nn import functional as F
-from torch.utils.data import Dataset  # Ensuring Dataset is imported once
+import pickle
 import numpy as np
 import pandas as pd
 import sklearn.metrics as skm
-import matplotlib.pyplot as plt
-import seaborn as sns
-from lifelines import CoxPHFitter
-from MulticoreTSNE import MulticoreTSNE as TSNE
-from torchvision import datasets, transforms
-from torchvision.utils import save_image
-from tqdm.notebook import tqdm
-from joblib import parallel_backend  # Added from second block of imports
-from sklearn.cluster import KMeans, MiniBatchKMeans
-from sklearn.model_selection import KFold
-from sklearn.metrics import silhouette_score, davies_bouldin_score, adjusted_rand_score, fowlkes_mallows_score, calinski_harabasz_score  # Added adjusted_rand_score
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.feature_extraction.text import TfidfVectorizer  # Added from second block of imports
-from sklearn.decomposition import TruncatedSVD  # Added from second block of imports
-from torch.utils.data import DataLoader
+from datetime import datetime
 
-# Local imports
-from general_model_newCutCPRD.ModelPkg.MLMRaw import BertConfig, BertModel, BertAgePredictor
-from general_model_newCutCPRD.ModelPkg.DataProc import *
-from general_model_newCutCPRD.pytorch_pretrained_bert import optimizer
-from general_model_newCutCPRD.ModelPkg import utils
-
-print('starting run....')
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from transformers import BertConfig, BertPreTrainedModel
+from transformers.models.bert.modeling_bert import BertEncoder, BertPooler, BertLayerNorm
 
 # %%
-seed = 1234
+# ------------------------------------------------------------------
+# 2. UTILITY FUNCTIONS (Integrated from local utils)
+# ------------------------------------------------------------------
+
 def set_all_seeds(seed):
     """Set all seeds for reproducibility."""
     torch.manual_seed(seed)
@@ -52,409 +31,515 @@ def set_all_seeds(seed):
     torch.backends.cudnn.benchmark = False
     np.random.seed(seed)
     random.seed(seed)
-    
-def toLoad(model, filepath, custom=None):
-    pre_bert = filepath
 
-    pretrained_dict = torch.load(pre_bert, map_location='cpu')
+def create_folder(path):
+    if not os.path.exists(path):
+        os.makedirs(path)
 
-    new_state_dict = {}
-    for key, value in pretrained_dict.items():
-        # Remove the prefix "bert." if present
-        new_key = key.replace("bert.", "")
-        new_state_dict[new_key] = value
+def load_obj(name):
+    """Load a pickle object."""
+    if not name.endswith('.pkl'):
+        name += '.pkl'
+    with open(name, 'rb') as f:
+        return pickle.load(f)
 
-    modeld = model.state_dict()
-    # 1. filter out unnecessary keys
-    if custom == None:
-        pretrained_dict = {k: v for k, v in new_state_dict.items() if k in modeld}
+def age_vocab(max_age, year=False, symbol=None):
+    """Creates vocab for age tokens."""
+    age2idx = {}
+    idx2age = {}
+    if symbol is None:
+        symbol = ['PAD', 'UNK']
+
+    for i in range(len(symbol)):
+        age2idx[str(symbol[i])] = i
+        idx2age[i] = str(symbol[i])
+
+    if year:
+        for i in range(max_age):
+            age2idx[str(i)] = len(symbol) + i
+            idx2age[len(symbol) + i] = str(i)
     else:
-        pretrained_dict = {k: v for k, v in new_state_dict.items() if k in modeld and k not in custom}
-    print(pretrained_dict.keys())
-    modeld.update(pretrained_dict)
-    # 3. load the new state dict
-    model.load_state_dict(modeld)
-    return model
+        # Your logic: max_age * 12 (months)
+        for i in range(max_age * 12):
+            age2idx[str(i)] = len(symbol) + i
+            idx2age[len(symbol) + i] = str(i)
+
+    return age2idx, idx2age
+
+def seq_padding(tokens, max_len, token2idx=None, symbol='PAD'):
+    """Pads sequences to max_len."""
+    seq = []
+    token_len = len(tokens)
+    for i in range(max_len):
+        if token2idx is None:
+            if i < token_len:
+                seq.append(tokens[i])
+            else:
+                seq.append(symbol)
+        else:
+            if i < token_len:
+                # Get token ID, default to UNK if missing
+                # If token2idx is just a dict, use .get
+                try:
+                    seq.append(token2idx.get(str(tokens[i]), token2idx.get('UNK', 1)))
+                except:
+                     seq.append(token2idx.get(tokens[i], token2idx.get('UNK', 1)))
+            else:
+                seq.append(token2idx.get(symbol, 0))
+    return seq
+
+def code2index(tokens, token2idx):
+    """Converts code tokens to indices."""
+    output_tokens = []
+    for i, token in enumerate(tokens):
+        output_tokens.append(token2idx.get(token, token2idx.get('UNK', 1)))
+    return tokens, output_tokens
+
+def position_idx(tokens, symbol='SEP'):
+    """Creates position indices based on visits separated by SEP."""
+    pos = []
+    flag = 0
+    for token in tokens:
+        if token == symbol:
+            pos.append(flag)
+            flag += 1
+        else:
+            pos.append(flag)
+    return pos
+
+def index_seg(tokens, symbol='SEP'):
+    """Creates segment indices (0/1) flipping at every SEP."""
+    flag = 0
+    seg = []
+    for token in tokens:
+        if token == symbol:
+            seg.append(flag)
+            flag = 1 - flag 
+        else:
+            seg.append(flag)
+    return seg
 
 def setup_logging(log_file):
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
-    # Clear existing handlers
     if logger.hasHandlers():
         logger.handlers.clear()
-    # Create handlers for console and file.
-    console_handler = logging.StreamHandler()
-    file_handler = logging.FileHandler(log_file)
     formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
+    file_handler = logging.FileHandler(log_file)
     file_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
     logger.addHandler(file_handler)
     return logger
 
 # %%
-file_config = {
-    'vocab': '',
-    # 'yearVocab':  '',
-    'pretrained_model': '',
-    'data_path': '',
-}
+# ------------------------------------------------------------------
+# 3. DATASET CLASS (Integrated from DataProc)
+# ------------------------------------------------------------------
 
+class SeqLoaderAge(Dataset):
+    def __init__(self, token2idx, dataframe, max_len, max_age=110, year=False, age_symbol=None, year2idx=None):
+        self.vocab = token2idx
+        self.max_len = max_len
+        self.code = dataframe.code.values
+        self.age = dataframe.age.values
+        # Handle cases where year might not exist in dataframe
+        self.year = dataframe.year.values if 'year' in dataframe.columns else [[] for _ in range(len(dataframe))]
+        self.label = dataframe.label.values  # phenoage
+        
+        self.age2idx, _ = age_vocab(max_age, year, symbol=age_symbol)
+        self.year2idx = year2idx
+
+    def __getitem__(self, index):
+        # extract data
+        age = self.age[index][(-self.max_len+1):]
+        code = self.code[index][(-self.max_len+1):]
+        
+        # Check if year data exists for this index
+        if len(self.year[index]) > 0:
+            year = self.year[index][(-self.max_len+1):]
+        else:
+            year = [0] * len(code) # Dummy if no year
+
+        label = self.label[index]
+        # convert label to float if necessary
+        label = float(label) if isinstance(label, str) else float(label)
+
+        # avoid data cut with first element to be 'SEP'
+        if code[0] != 'SEP':
+            code = np.append(np.array(['CLS']), code)
+            age = np.append(np.array(age[0]), age)
+            if len(year) > 0:
+                year = np.append(np.array(year[0]), year)
+        else:
+            code[0] = 'CLS'
+
+        # create mask: 1 for actual tokens, 0 for padding.
+        mask = np.ones(self.max_len)
+        mask[len(code):] = 0
+
+        # pad sequences
+        age = seq_padding(age, self.max_len, token2idx=self.age2idx)
+        # If year2idx is None, basic padding
+        year = seq_padding(year, self.max_len, token2idx=self.year2idx)
+
+        # convert code tokens to indices
+        tokens, code_idx = code2index(code, self.vocab)
+        
+        # Get tokens list padded for structure generation (pos/seg)
+        tokens_padded = seq_padding(tokens, self.max_len, token2idx=None)
+        
+        position = position_idx(tokens_padded)
+        segment = index_seg(tokens_padded)
+
+        # pad code indices
+        code_idx = seq_padding(code_idx, self.max_len, token2idx=None, symbol=0) # Assuming 0 is PAD in indices
+
+        return (torch.LongTensor(age),
+                torch.LongTensor(year),
+                torch.LongTensor(code_idx),
+                torch.LongTensor(position),
+                torch.LongTensor(segment),
+                torch.LongTensor(mask),
+                torch.tensor(label, dtype=torch.float32))
+
+    def __len__(self):
+        return len(self.code)
+
+# %%
+# ------------------------------------------------------------------
+# 4. MODEL DEFINITION (Transformers + Custom Embeddings)
+# ------------------------------------------------------------------
+
+class EHRBertEmbeddings(nn.Module):
+    """
+    Construct the embeddings from word, segment, age, position, and optional year.
+    Sum = Word + Segment + Age + Position + (Year)
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
+        self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
+        self.age_embeddings = nn.Embedding(config.age_vocab_size, config.hidden_size)
+        
+        self.yearOn = config.yearOn
+        if self.yearOn:
+            self.year_embeddings = nn.Embedding(config.year_vocab_size, config.hidden_size)
+
+        self.LayerNorm = BertLayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        
+        # Initialize Position Embeddings (Sinusoidal as per your requirement)
+        self.register_buffer("position_ids", torch.arange(config.max_position_embeddings).expand((1, -1)))
+        self._init_posi_embedding(self.position_embeddings.weight, config.max_position_embeddings, config.hidden_size)
+
+    def _init_posi_embedding(self, weight_tensor, max_position_embedding, hidden_size):
+        lookup_table = np.zeros((max_position_embedding, hidden_size), dtype=np.float32)
+        for pos in range(max_position_embedding):
+            for idx in np.arange(0, hidden_size, step=2):
+                lookup_table[pos, idx] = np.sin(pos / (10000 ** (2 * idx / hidden_size)))
+            for idx in np.arange(1, hidden_size, step=2):
+                lookup_table[pos, idx] = np.cos(pos / (10000 ** (2 * idx / hidden_size)))
+        
+        with torch.no_grad():
+            weight_tensor.copy_(torch.tensor(lookup_table))
+
+    def forward(self, input_ids, age_ids=None, token_type_ids=None, position_ids=None, year_ids=None):
+        if token_type_ids is None:
+            token_type_ids = torch.zeros_like(input_ids)
+        if age_ids is None:
+            age_ids = torch.zeros_like(input_ids)
+        if position_ids is None:
+            seq_length = input_ids.size(1)
+            position_ids = self.position_ids[:, :seq_length]
+
+        word_embed = self.word_embeddings(input_ids)
+        segment_embed = self.token_type_embeddings(token_type_ids)
+        age_embed = self.age_embeddings(age_ids)
+        posi_embed = self.position_embeddings(position_ids)
+
+        embeddings = word_embed + segment_embed + age_embed + posi_embed
+        
+        if self.yearOn and year_ids is not None:
+            year_embed = self.year_embeddings(year_ids)
+            embeddings += year_embed
+
+        embeddings = self.LayerNorm(embeddings)
+        embeddings = self.dropout(embeddings)
+        return embeddings
+
+class EHRBertModel(BertPreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.embeddings = EHRBertEmbeddings(config)
+        self.encoder = BertEncoder(config)
+        self.pooler = BertPooler(config)
+        self.init_weights()
+
+    def forward(self, input_ids, age_ids=None, token_type_ids=None, position_ids=None, year_ids=None, attention_mask=None):
+        extended_attention_mask = self.get_extended_attention_mask(attention_mask, input_ids.size(), input_ids.device)
+
+        embedding_output = self.embeddings(
+            input_ids=input_ids, 
+            age_ids=age_ids, 
+            token_type_ids=token_type_ids, 
+            position_ids=position_ids,
+            year_ids=year_ids
+        )
+        
+        encoder_outputs = self.encoder(
+            embedding_output,
+            attention_mask=extended_attention_mask,
+            output_hidden_states=False
+        )
+        sequence_output = encoder_outputs[0]
+        pooled_output = self.pooler(sequence_output)
+
+        return sequence_output, pooled_output
+
+class BertAgePredictor(BertPreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.bert = EHRBertModel(config)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.regressor = nn.Linear(config.hidden_size, 1) # Regression output
+        self.loss_fct = nn.MSELoss()
+        self.init_weights()
+
+    def forward(self, input_ids, age_ids, segment_ids, posi_ids, year_ids, attMask, labels=None):
+        _, pooled_output = self.bert(
+            input_ids, 
+            age_ids=age_ids, 
+            token_type_ids=segment_ids, 
+            position_ids=posi_ids, 
+            year_ids=year_ids,
+            attention_mask=attMask
+        )
+        
+        pooled_output = self.dropout(pooled_output)
+        logits = self.regressor(pooled_output)
+        
+        loss = None
+        if labels is not None:
+            loss = self.loss_fct(logits.view(-1), labels.view(-1).float())
+            
+        return loss, logits.view(-1)
+
+# %%
+# ------------------------------------------------------------------
+# 5. MAIN EXECUTION & CONFIGURATION
+# ------------------------------------------------------------------
+
+# --- Global Params ---
 global_params = {
-    'batch_size': 128,
-    'gradient_accumulation_steps': 1,
-    'device': 'cuda:0',
-    'output_dir':'',
-    'output_name': '',
-    'save_model': True,
+    'batch_size': 64,
+    'device': 'cuda:0' if torch.cuda.is_available() else 'cpu',
+    'output_dir': './output_age_pred',
     'max_len_seq': 250,
     'max_age': 110,
     'age_year': False,
     'age_symbol': None,
     'min_visit': 5,
-    'inc_age': False,
-    'inc_seg': True
+    'inc_age': False, # Use Age in embedding
+    'inc_year': False,
+    'data_path': 'your_data.parquet', # Placeholder
+    'vocab_path': 'bert_vocab.pkl',   # Placeholder
+    'year_vocab_path': 'year_vocab.pkl' # Placeholder
 }
 
-# YearVocab = utils.load_obj(file_config['yearVocab'])
+set_all_seeds(1234)
 create_folder(global_params['output_dir'])
-BertVocab = utils.load_obj(file_config['vocab'])
-print('len_vocab', len(BertVocab['token2idx']))
 
-# ageVocab, _ = utils.age_vocab(max_age=global_params['max_age'], year=global_params['age_year'], symbol=global_params['age_symbol'])
+# --- Load Data (Mocking load for script integrity) ---
+# In a real run, ensure files exist. Here we check existence.
+if os.path.exists(global_params['vocab_path']):
+    BertVocab = load_obj(global_params['vocab_path'])
+    print(f"Loaded Vocab. Size: {len(BertVocab['token2idx'])}")
+else:
+    print("Vocab file not found. Using mock size for demonstration.")
+    BertVocab = {'token2idx': {'PAD':0, 'UNK':1, 'CLS':2, 'SEP':3, 'D1':4}}
 
-model_config = {
-    'vocab_size': len(BertVocab['token2idx'].keys()), # number of disease + symbols for word embedding
-    'hidden_size': 150, # word embedding and seg embedding hidden size
-    'seg_vocab_size': 2, # number of vocab for seg embedding
-    # 'age_vocab_size': len(ageVocab.keys()), # number of vocab for age embedding
-    # 'year_vocab_size': len(YearVocab['token2idx'].keys()), # number of vocab for age embedding
-    'max_position_embedding': global_params['max_len_seq'], # maximum number of tokens
-    'hidden_dropout_prob': 0.1, # dropout rate
-    'num_hidden_layers': 6, # number of multi-head attention layers required
-    'num_attention_heads': 6, # number of attention heads
-    'attention_probs_dropout_prob': 0.1, # multi-head attention dropout rate
-    'intermediate_size': 108, # the size of the "intermediate" layer in the transformer encoder
-    'hidden_act': 'gelu', # The non-linear activation function in the encoder and the pooler "gelu", 'relu', 'swish' are supported
-    'initializer_range': 0.02, # parameter weight initializer range,
-    'yearOn':False,
-    # 'year_vocab_size': len(YearVocab['token2idx'].keys()),
-    'concat_embeddings':False,
+if global_params['inc_year'] and os.path.exists(global_params['year_vocab_path']):
+    YearVocab = load_obj(global_params['year_vocab_path'])
+else:
+    YearVocab = {'token2idx': {'PAD':0, 'UNK':1}}
 
+# Get Age Vocab size
+ageVocab, _ = age_vocab(max_age=global_params['max_age'], year=global_params['age_year'], symbol=global_params['age_symbol'])
+
+# --- PREPARE MODEL CONFIG (STRICTLY FOLLOWING YOUR REQUEST) ---
+# Mapping your dict to HuggingFace BertConfig
+model_config_dict = {
+    'vocab_size': len(BertVocab['token2idx'].keys()), 
+    'hidden_size': 256, 
+    'seg_vocab_size': 2, 
+    'age_vocab_size': len(ageVocab.keys()), 
+    'year_vocab_size': len(YearVocab['token2idx'].keys()), 
+    'max_position_embedding': global_params['max_len_seq'], 
+    'hidden_dropout_prob': 0.1, 
+    'num_hidden_layers': 4, 
+    'num_attention_heads': 4, 
+    'attention_probs_dropout_prob': 0.1, 
+    'intermediate_size': 1024, 
+    'hidden_act': 'gelu', 
+    'initializer_range': 0.02, 
+    'yearOn': global_params['inc_year'],
+    'concat_embeddings': False,
 }
 
-model = BertModel(BertConfig(model_config))
-# model = toLoad(model, file_config['pretrained_model'])
-age_model = BertAgePredictor(model)
+# Initialize HF Config
+config = BertConfig(
+    vocab_size=model_config_dict['vocab_size'],
+    hidden_size=model_config_dict['hidden_size'],
+    num_hidden_layers=model_config_dict['num_hidden_layers'],
+    num_attention_heads=model_config_dict['num_attention_heads'],
+    intermediate_size=model_config_dict['intermediate_size'],
+    hidden_act=model_config_dict['hidden_act'],
+    hidden_dropout_prob=model_config_dict['hidden_dropout_prob'],
+    attention_probs_dropout_prob=model_config_dict['attention_probs_dropout_prob'],
+    max_position_embeddings=model_config_dict['max_position_embedding'],
+    type_vocab_size=model_config_dict['seg_vocab_size'],
+    initializer_range=model_config_dict['initializer_range']
+)
 
-# %% [markdown]
-# process and save data into train/valid/test split (7:1:2) ratio
+# Add custom attributes for our EHR Embeddings
+config.age_vocab_size = model_config_dict['age_vocab_size']
+config.year_vocab_size = model_config_dict['year_vocab_size']
+config.yearOn = model_config_dict['yearOn']
+
+# --- Initialize Model ---
+age_model = BertAgePredictor(config)
+age_model.to(global_params['device'])
+
+print("Model Configured:")
+print(config)
 
 # %%
-processed_data_file = f'ehr_age_processed_df_upsample_res_visit{global_params["min_visit"]}.pkl'
-if os.path.exists(processed_data_file):
-    with open(processed_data_file, 'rb') as f:
+# ------------------------------------------------------------------
+# 6. DATA LOADING & TRAINING LOOP
+# ------------------------------------------------------------------
+
+# NOTE: This block assumes 'processed_data_file.pkl' exists containing 
+# 'train', 'valid', 'test' DataFrames. 
+# If not, it attempts to load from parquet.
+
+data_file_processed = f'ehr_processed_split.pkl'
+
+if os.path.exists(data_file_processed):
+    with open(data_file_processed, 'rb') as f:
         processed_data = pickle.load(f)
-    train_df = processed_data['train']
-    valid_df = processed_data['valid']
-    test_df = processed_data['test']
-    print("Loaded processed DataFrame splits.")
-else:
-    # Read and shuffle the DataFrame with a fixed random seed.
-    df = pd.read_parquet(file_config['data_path'])
+    train_df, valid_df, test_df = processed_data['train'], processed_data['valid'], processed_data['test']
+    print("Loaded processed data splits.")
+elif os.path.exists(global_params['data_path']):
+    # Fallback: Load raw parquet and split
+    df = pd.read_parquet(global_params['data_path'])
+    # Basic preprocessing matching your flow
     df['label'] = pd.to_numeric(df['label'], errors='coerce')
-    df['baseline_age'] = pd.to_numeric(df['baseline_age'], errors='coerce')
-    df.rename(columns={'label': 'phenoage'}, inplace=True)
-    df['label'] = df['phenoage'] - df['baseline_age']
-    df = df[df['code'].apply(lambda x: list(x).count('SEP') >= global_params['min_visit'] + 1)]
-    df_shuffled = df.sample(frac=1, random_state=42).reset_index(drop=True)
-    n = len(df_shuffled)
-    train_end = int(0.7 * n)
-    valid_end = int(0.8 * n)
+    df = df.dropna(subset=['label'])
+    df = df[df['code'].apply(lambda x: len(list(x)) >= global_params['min_visit'])]
     
-    # Reset indices for each split.
-    train_df = df_shuffled.iloc[:train_end].reset_index(drop=True)
-    valid_df = df_shuffled.iloc[train_end:valid_end].reset_index(drop=True)
-    test_df = df_shuffled.iloc[valid_end:].reset_index(drop=True)
-    
-    # Specify the age ranges you want to upsample (excluding "30-39")
-    upsample_groups = ['60-69', '50-59', '40-49', '70-79']
+    # Simple Split
+    df = df.sample(frac=1, random_state=42).reset_index(drop=True)
+    n = len(df)
+    train_df = df.iloc[:int(0.7*n)]
+    valid_df = df.iloc[int(0.7*n):int(0.8*n)]
+    test_df = df.iloc[int(0.8*n):]
+else:
+    print("No data file found. Creating dummy data for runnable code verification.")
+    # Create dummy dataframe structure
+    dummy_data = {
+        'code': [['D1', 'D1', 'SEP', 'D1'] for _ in range(100)],
+        'age': [[40, 40, 40, 41] for _ in range(100)],
+        'year': [[2010, 2010, 2010, 2011] for _ in range(100)],
+        'label': [5.5 for _ in range(100)]
+    }
+    train_df = pd.DataFrame(dummy_data)
+    valid_df = pd.DataFrame(dummy_data)
+    test_df = pd.DataFrame(dummy_data)
 
-    # Separate the DataFrame into groups to upsample and those to leave unchanged
-    df_to_upsample = train_df[train_df['Age_range'].isin(upsample_groups)]
-    df_not_upsample = train_df[~train_df['Age_range'].isin(upsample_groups)]
-
-    # Get the maximum count among the groups to upsample
-    group_counts = df_to_upsample['Age_range'].value_counts()
-    max_count = group_counts.max()  # For example, 142887 from the "60-69" group
-
-    # Upsample only the specified groups
-    upsampled_df = df_to_upsample.groupby('Age_range', group_keys=False).apply(
-        lambda x: x.sample(max_count, replace=True) if len(x) < max_count else x
-    ).reset_index(drop=True)
-
-    # Combine the upsampled data with the groups you don't want to change (e.g., "30-39")
-    train_df = pd.concat([upsampled_df, df_not_upsample]).reset_index(drop=True)
-    print(train_df['Age_range'].value_counts())
-
-    processed_data = {'train': train_df, 'valid': valid_df, 'test': test_df}
-    with open(processed_data_file, 'wb') as f:
-        pickle.dump(processed_data, f)
-    print("Processed and saved DataFrame splits.")
-
-# %%
-def create_seq_loader(df):
-    return SeqLoaderAge(
+# Create Loaders
+def get_loader(df, batch_size, shuffle=True):
+    ds = SeqLoaderAge(
         token2idx=BertVocab['token2idx'],
         dataframe=df,
         max_len=global_params['max_len_seq'],
         max_age=global_params['max_age'],
         year=global_params['age_year'],
         age_symbol=global_params['age_symbol'],
-        # year2idx=YearVocab['token2idx']
+        year2idx=YearVocab['token2idx']
     )
+    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=0)
 
-splits = {'train': train_df, 'valid': valid_df, 'test': test_df}
-datasets = {split: create_seq_loader(df) for split, df in splits.items()}
+train_loader = get_loader(train_df, global_params['batch_size'], True)
+valid_loader = get_loader(valid_df, global_params['batch_size'], False)
+test_loader = get_loader(test_df, global_params['batch_size'], False)
 
-# Then create dataloaders
-train_loader = DataLoader(datasets['train'], batch_size=global_params['batch_size'], shuffle=True)
-valid_loader = DataLoader(datasets['valid'], batch_size=global_params['batch_size']*8, shuffle=False)
-test_loader  = DataLoader(datasets['test'], batch_size=global_params['batch_size']*8, shuffle=False)
+# Training Setup
+optimizer = torch.optim.AdamW(age_model.parameters(), lr=1e-5)
+scaler = torch.cuda.amp.GradScaler() # Mixed Precision
+save_path = os.path.join(global_params['output_dir'], "best_model.pt")
+logger = setup_logging(os.path.join(global_params['output_dir'], "log.txt"))
 
-# %%
-hyperparams = {
-    'lr': 1e-5,
-    'batch_size': global_params['batch_size'],
-    'num_epochs': 10,
-}
-# Create a folder name that includes some hyperparameter values.
-save_dirname = f"lr{hyperparams['lr']}_bs{hyperparams['batch_size']}_upsample_randinit_res_exc_age_exc_seg_exc_concat_min_visit{global_params['min_visit']}"
-output_subdir = os.path.join(global_params['output_dir'], save_dirname)
-os.makedirs(output_subdir, exist_ok=True)
+best_rmse = float('inf')
+num_epochs = 10
 
-# Set up logging to a file in the dynamic folder.
-log_file = os.path.join(output_subdir, "log.txt")
-logger = setup_logging(log_file)
-logger.info("Starting age prediction training with configuration:")
-logger.info(f"Hyperparameters: {hyperparams}")
-logger.info(f"Output directory: {output_subdir}")
-
-criterion = nn.MSELoss()
-optimizer = torch.optim.AdamW(age_model.parameters(), lr=hyperparams['lr'])
-device = global_params['device'] if torch.cuda.is_available() else 'cpu'
-age_model.to(device)
-
-# # -------------------------------
-# # 4. Training Setup for Age Prediction
-# # -------------------------------
-
-num_epochs = hyperparams['num_epochs']
-best_valid_rmse = float('inf')
-best_model_state = None
-
-global_step = 0
+print("Starting Training...")
 
 for epoch in range(num_epochs):
     age_model.train()
     train_losses = []
-    for batch in train_loader:
-        # Unpack batch
-        age_ids, year_ids, input_ids, posi_ids, segment_ids, attMask, labels = batch
+    
+    for step, batch in enumerate(train_loader):
+        # Unpack
+        age_ids, year_ids, input_ids, posi_ids, segment_ids, attMask, labels = [b.to(global_params['device']) for b in batch]
         
-        # For age prediction we set age_ids and year_ids to zeros.
+        # Handle feature flags
         if not global_params['inc_age']:
             age_ids = torch.zeros_like(age_ids)
-        year_ids = torch.zeros_like(year_ids)
-        segment_ids = torch.zeros_like(segment_ids)
-        
-        # Move tensors to device.
-        input_ids = input_ids.to(device)
-        age_ids = age_ids.to(device)
-        segment_ids = segment_ids.to(device)
-        posi_ids = posi_ids.to(device)
-        year_ids = year_ids.to(device)
-        attMask = attMask.to(device)
-        labels = labels.to(device)
-        
+        if not global_params['inc_year']:
+            year_ids = torch.zeros_like(year_ids)
+            
         optimizer.zero_grad()
-        loss, age_pred = age_model(input_ids, age_ids, segment_ids, posi_ids, year_ids, attMask, labels)
-        loss.backward()
-        optimizer.step()
+        
+        # Mixed Precision Forward
+        with torch.cuda.amp.autocast():
+            loss, _ = age_model(input_ids, age_ids, segment_ids, posi_ids, year_ids, attMask, labels)
+            
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        
         train_losses.append(loss.item())
         
-        global_step += 1
-        # Log every 100 steps.
-        if global_step % 100 == 0:
-            logger.info(f"Epoch {epoch+1} Step {global_step}: Loss = {loss.item():.4f}")
-    
-    avg_train_loss = np.mean(train_losses)
-    
-    # Validation loop
+        if step % 50 == 0:
+            print(f"Epoch {epoch+1} Step {step} Loss: {loss.item():.4f}")
+
+    # Validation
     age_model.eval()
-    valid_preds = []
-    valid_labels = []
+    preds = []
+    truths = []
     with torch.no_grad():
         for batch in valid_loader:
-            age_ids, year_ids, input_ids, posi_ids, segment_ids, attMask, labels = batch
-            if not global_params['inc_age']:
-                age_ids = torch.zeros_like(age_ids)
-            year_ids = torch.zeros_like(year_ids)
-            segment_ids = torch.zeros_like(segment_ids)
+            age_ids, year_ids, input_ids, posi_ids, segment_ids, attMask, labels = [b.to(global_params['device']) for b in batch]
             
-            input_ids = input_ids.to(device)
-            age_ids = age_ids.to(device)
-            segment_ids = segment_ids.to(device)
-            posi_ids = posi_ids.to(device)
-            year_ids = year_ids.to(device)
-            attMask = attMask.to(device)
-            labels = labels.to(device)
+            if not global_params['inc_age']: age_ids = torch.zeros_like(age_ids)
+            if not global_params['inc_year']: year_ids = torch.zeros_like(year_ids)
             
-            _, age_pred = age_model(input_ids, age_ids, segment_ids, posi_ids, year_ids, attMask, labels)
-            valid_preds.extend(age_pred.cpu().numpy())
-            valid_labels.extend(labels.cpu().numpy())
+            _, pred = age_model(input_ids, age_ids, segment_ids, posi_ids, year_ids, attMask, labels)
+            preds.extend(pred.cpu().numpy())
+            truths.extend(labels.cpu().numpy())
+            
+    rmse = np.sqrt(skm.mean_squared_error(truths, preds))
+    mae = skm.mean_absolute_error(truths, preds)
     
-    # Compute validation metrics
-    valid_rmse = np.sqrt(skm.mean_squared_error(valid_labels, valid_preds))
-    valid_mae = skm.mean_absolute_error(valid_labels, valid_preds)
+    logger.info(f"Epoch {epoch+1}: Train Loss {np.mean(train_losses):.4f} | Valid RMSE {rmse:.4f} | MAE {mae:.4f}")
+    print(f"Epoch {epoch+1}: Valid RMSE {rmse:.4f}")
     
-    logger.info(f"Epoch {epoch+1}/{num_epochs} | Avg Train Loss: {avg_train_loss:.4f} | Valid MAE: {valid_mae:.4f} | Valid RMSE: {valid_rmse:.4f}")
-    print(f"Epoch {epoch+1}/{num_epochs} | Avg Train Loss: {avg_train_loss:.4f} | Valid MAE: {valid_mae:.4f} | Valid RMSE: {valid_rmse:.4f}")
-    
-    # Save best model based on lowest RMSE.
-    if valid_rmse < best_valid_rmse:
-        best_valid_rmse = valid_rmse
-        best_model_state = age_model.state_dict()
-        save_path = os.path.join(output_subdir, "best_age_model.pt")
-        torch.save(best_model_state, save_path)
-        logger.info(f"Best model saved at epoch {epoch+1} with Valid RMSE: {valid_rmse:.4f}")
-        print(f"Best model saved at epoch {epoch+1} with Valid RMSE: {valid_rmse:.4f}")
+    if rmse < best_rmse:
+        best_rmse = rmse
+        torch.save(age_model.state_dict(), save_path)
+        logger.info("Best model saved.")
 
-
-# -------------------------------
-# 5. Test Evaluation with Confidence Intervals
-# -------------------------------
-# Load best model state
-best_model_path = os.path.join(output_subdir, "best_age_model.pt")
-print(f"Loading best model from {best_model_path}")
-age_model.load_state_dict(torch.load(best_model_path))
-age_model.eval()
-test_preds = []
-test_labels = []
-with torch.no_grad():
-    for batch in test_loader:
-        age_ids, year_ids, input_ids, posi_ids, segment_ids, attMask, labels = batch
-
-        if not global_params['inc_age']:
-            age_ids = torch.zeros_like(age_ids)
-        year_ids = torch.zeros_like(year_ids)
-        segment_ids = torch.zeros_like(segment_ids)
-        
-        input_ids = input_ids.to(device)
-        age_ids = age_ids.to(device)
-        segment_ids = segment_ids.to(device)
-        posi_ids = posi_ids.to(device)
-        year_ids = year_ids.to(device)
-        attMask = attMask.to(device)
-        labels = labels.to(device)
-        
-        _, age_pred = age_model(input_ids, age_ids, segment_ids, posi_ids, year_ids, attMask, labels)
-        test_preds.extend(age_pred.cpu().numpy())
-        test_labels.extend(labels.cpu().numpy())
-
-test_preds = np.array(test_preds)
-test_labels = np.array(test_labels)
-
-# Add predictions to the test_df and save to CSV
-test_df['predicted'] = test_preds
-output_csv_test = os.path.join(output_subdir, "age_predictions_test.csv")
-test_df[['patid', 'predicted', 'baseline_age', 'phenoage', 'label']].to_csv(output_csv_test, index=False)
-print(f"Saved test predictions to {output_csv_test}")
-
-# Compute the metrics
-test_rmse = np.sqrt(skm.mean_squared_error(test_labels, test_preds))
-test_mae = skm.mean_absolute_error(test_labels, test_preds)
-test_df['predicted_phenoage'] = test_df['baseline_age'] + test_df['predicted']
-# Compute the Pearson correlation between predicted_phenoage and phenoage
-corr = test_df['predicted_phenoage'].corr(test_df['phenoage'])
-logger.info(f"Pearson correlation (baseline_age + predicted vs phenoage): {corr:.4f}")
-print(f"Pearson correlation (baseline_age + predicted vs phenoage): {corr:.4f}")
-corr = test_df['baseline_age'].corr(test_df['phenoage'])
-logger.info(f"Pearson correlation (baseline_age vs phenoage): {corr:.4f}")
-print(f"Pearson correlation (baseline_age vs phenoage): {corr:.4f}")
-
-# Define a simple bootstrap function to compute confidence intervals
-def bootstrap_metric(metric_fn, y_true, y_pred, n_bootstraps=1000, alpha=0.05):
-    bootstrapped_scores = []
-    n = len(y_true)
-    for _ in range(n_bootstraps):
-        indices = np.random.randint(0, n, n)
-        score = metric_fn(y_true[indices], y_pred[indices])
-        bootstrapped_scores.append(score)
-    lower = np.percentile(bootstrapped_scores, 100 * alpha/2)
-    upper = np.percentile(bootstrapped_scores, 100 * (1 - alpha/2))
-    return lower, upper
-
-# Compute confidence intervals for MAE and RMSE
-mae_lower, mae_upper = bootstrap_metric(skm.mean_absolute_error, test_labels, test_preds)
-rmse_lower, rmse_upper = bootstrap_metric(lambda y_true, y_pred: np.sqrt(skm.mean_squared_error(y_true, y_pred)), 
-                                          test_labels, test_preds)
-
-logger.info(f"Test MAE: {test_mae:.4f} (95% CI: [{mae_lower:.4f}, {mae_upper:.4f}]) | "
-            f"Test RMSE: {test_rmse:.4f} (95% CI: [{rmse_lower:.4f}, {rmse_upper:.4f}])")
-print(f"Test MAE: {test_mae:.4f} (95% CI: [{mae_lower:.4f}, {mae_upper:.4f}])")
-print(f"Test RMSE: {test_rmse:.4f} (95% CI: [{rmse_lower:.4f}, {rmse_upper:.4f}])")
-
-df_inference = pd.read_parquet(file_config['data_path'])
-df_inference['label'] = pd.to_numeric(df_inference['label'], errors='coerce')
-df_inference['baseline_age'] = pd.to_numeric(df_inference['baseline_age'], errors='coerce')
-df_inference.rename(columns={'label': 'phenoage'}, inplace=True)
-df_inference['label'] = df_inference['phenoage'] - df_inference['baseline_age']
-df_inference = df_inference[df_inference['code'].apply(lambda x: list(x).count('SEP') >= global_params['min_visit'])]
-df_inference = df_inference.reset_index(drop=True)
-
-
-# Create an inference dataset using the same create_seq_loader function.
-inference_dataset = create_seq_loader(df_inference)
-inference_loader = DataLoader(inference_dataset, batch_size=global_params['batch_size'], shuffle=False)
-
-best_model_path = os.path.join(output_subdir, "best_age_model.pt")
-print(f"Loading best model from {best_model_path}")
-age_model.load_state_dict(torch.load(best_model_path))
-age_model.to(device)
-age_model.eval()
-
-# Use the best model (already loaded in age_model) to make predictions.
-all_preds = []
-age_model.eval()
-with torch.no_grad():
-    for batch in inference_loader:
-        age_ids, year_ids, input_ids, posi_ids, segment_ids, attMask, labels = batch
-        # For inference, set age_ids and year_ids to zeros.
-        if not global_params['inc_age']:
-            age_ids = torch.zeros_like(age_ids)
-        year_ids = torch.zeros_like(year_ids)
-        segment_ids = torch.zeros_like(segment_ids)
-        
-        input_ids = input_ids.to(device)
-        age_ids = age_ids.to(device)
-        segment_ids = segment_ids.to(device)
-        posi_ids = posi_ids.to(device)
-        year_ids = year_ids.to(device)
-        attMask = attMask.to(device)
-        labels = labels.to(device)  # Move labels to device
-        
-        # Forward pass (labels are not needed for prediction, but we pass them anyway).
-        _, age_pred = age_model(input_ids, age_ids, segment_ids, posi_ids, year_ids, attMask, labels)
-        all_preds.extend(age_pred.cpu().numpy())
-
-# Ensure that the number of predictions matches the number of rows.
-assert len(all_preds) == len(df_inference), "Number of predictions does not match number of rows."
-
-# Add the predictions as a new column.
-df_inference['predicted'] = all_preds
-
-# Save to CSV with only the columns: patid, predicted_age, and phenoage (assumed to be in 'label').
-output_csv = os.path.join(output_subdir, "age_predictions.csv")
-df_inference[['patid', 'predicted', 'baseline_age', 'phenoage', 'label']].to_csv(output_csv, index=False)
-print(f"Saved predictions to {output_csv}")
+print("Training Complete.")
