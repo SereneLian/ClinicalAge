@@ -6,7 +6,7 @@
 
 The repository provides the full workflow for **reproducing the study's results**, including data preprocessing, model training, inference, and comprehensive downstream validation.
 
- 
+The UK Biobank PhenoAge formula is based on the method described in https://elifesciences.org/reviewed-preprints/91101.
 
 *(A high-level diagram illustrating the flow from EHR sequence data to the BERT-like model, predicting the ClinicalAge Gap, and subsequent downstream analyses like biomarker validation and survival modeling)*
 
