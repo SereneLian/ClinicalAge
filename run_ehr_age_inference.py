@@ -104,7 +104,7 @@ BertVocab = extend_vocab_with_numbers(BertVocab, start=0, end=100)
 print('len_vocab', len(BertVocab['token2idx']))
 
 # Assume age vocabulary function is available in utils
-ageVocab, _ = utils.age_vocab(max_age=global_params['max_age'], year=global_params['age_year'], symbol=global_params['age_symbol'])
+# ageVocab, _ = utils.age_vocab(max_age=global_params['max_age'], year=global_params['age_year'], symbol=global_params['age_symbol'])
 
 # Set up model configurations and load the pretrained model.
 from general_model_newCutCPRD.ModelPkg.MLMRaw import BertConfig, BertModel, BertAgePredictor
@@ -113,8 +113,8 @@ model_config = {
     'vocab_size': len(BertVocab['token2idx'].keys()), # number of disease + symbols for word embedding
     'hidden_size': 256, # word embedding and seg embedding hidden size
     'seg_vocab_size': 2, # number of vocab for seg embedding
-    'age_vocab_size': len(ageVocab.keys()), # number of vocab for age embedding
-    'year_vocab_size': len(YearVocab['token2idx'].keys()), # number of vocab for age embedding
+    # 'age_vocab_size': len(ageVocab.keys()), # number of vocab for age embedding
+    # 'year_vocab_size': len(YearVocab['token2idx'].keys()), # number of vocab for age embedding
     'max_position_embedding': global_params['max_len_seq'], # maximum number of tokens
     'hidden_dropout_prob': 0.1, # dropout rate
     'num_hidden_layers': 4, # number of multi-head attention layers required
@@ -124,7 +124,7 @@ model_config = {
     'hidden_act': 'gelu', # The non-linear activation function in the encoder and the pooler "gelu", 'relu', 'swish' are supported
     'initializer_range': 0.02, # parameter weight initializer range,
     'yearOn':False,
-    'year_vocab_size': len(YearVocab['token2idx'].keys()),
+    # 'year_vocab_size': len(YearVocab['token2idx'].keys()),
     'concat_embeddings':False,
 }
 
